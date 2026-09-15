@@ -8,12 +8,17 @@
 - 测评提交即写入 assessment_results，个人报告直接读该表。
 """
 import json
+import sqlite3
 from datetime import date, datetime, timedelta
 
 from . import db, security, validate
 from .validate import AppError
 
+# 登录：按 IP+账号 限流，防针对单个账号的暴力破解，且不因共享 IP 误伤他人
 login_limiter = security.RateLimiter(max_attempts=10, window_seconds=300)
+# 注册：按 IP+用户名 防针对性探测，按 IP 总量防批量注册
+register_limiter = security.RateLimiter(max_attempts=10, window_seconds=300)
+register_ip_limiter = security.RateLimiter(max_attempts=30, window_seconds=300)
 
 
 # ---------------------------------------------------------------- 工具
@@ -87,8 +92,6 @@ def require_admin(user):
 # ---------------------------------------------------------------- 认证
 
 def register(body, ip):
-    if not login_limiter.allow("register:" + ip):
-        raise AppError(429, "操作太频繁，请稍后再试")
     if not isinstance(body, dict):
         raise AppError(400, "请求格式不正确")
     username = validate.username(body.get("username"))
@@ -97,7 +100,14 @@ def register(body, ip):
     display = body.get("displayName")
     display = validate.display_name(display) if display else username
 
+    if not register_limiter.allow("register:{}:{}".format(ip, username.lower())):
+        raise AppError(429, "该用户名的注册尝试过于频繁，请稍后再试")
+    if not register_ip_limiter.allow("register:" + ip):
+        raise AppError(429, "注册请求过于频繁，请稍后再试")
+
     conn = db.get()
+    # 快速预检（覆盖常见的顺序重复场景）；并发下的唯一性由数据库
+    # UNIQUE 约束（COLLATE NOCASE）最终保证，见下方 IntegrityError 处理。
     exists = conn.execute(
         "SELECT username, email FROM users WHERE username = ? OR email = ?",
         (username, email)).fetchone()
@@ -106,20 +116,44 @@ def register(body, ip):
             raise AppError(409, "该用户名已被使用")
         raise AppError(409, "该邮箱已被注册")
 
-    cur = conn.execute(
-        "INSERT INTO users (username, email, password_hash, display_name) VALUES (?, ?, ?, ?)",
-        (username, email, security.hash_password(password), display))
-    conn.commit()
-    user = conn.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return 201, {"user": _user_public(user), "token": _create_session(user["id"])}
+    # 先算哈希（耗时约 0.1-0.3s）再开事务，把写锁持有时间压到最短，
+    # 降低并发注册时相互等待 / 超时的概率。
+    password_hash = security.hash_password(password)
+    token = security.new_session_token()
+    try:
+        cur = conn.execute(
+            "INSERT INTO users (username, email, password_hash, display_name)"
+            " VALUES (?, ?, ?, ?)",
+            (username, email, password_hash, display))
+        user_id = cur.lastrowid
+        # 账号与初始会话在同一事务提交：要么都成功，要么都不存在，不留半成品
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)",
+            (token, user_id, security.session_expiry()))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # 并发注册撞了唯一约束：整体回滚（不留半成品），再查明冲突方，
+        # 给失败请求一个明确的 409 而不是通用 500。
+        conn.rollback()
+        clash = conn.execute(
+            "SELECT username, email FROM users WHERE username = ? OR email = ?",
+            (username, email)).fetchone()
+        if clash is not None and clash["username"].lower() == username.lower():
+            raise AppError(409, "该用户名已被使用")
+        if clash is not None:
+            raise AppError(409, "该邮箱已被注册")
+        raise AppError(409, "该用户名或邮箱已被注册")
+
+    user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return 201, {"user": _user_public(user), "token": token}
 
 
 def login(body, ip):
-    if not login_limiter.allow("login:" + ip):
-        raise AppError(429, "尝试次数过多，请 5 分钟后再试")
     if not isinstance(body, dict):
         raise AppError(400, "请求格式不正确")
     username = validate.username(body.get("username"))
+    if not login_limiter.allow("login:{}:{}".format(ip, username.lower())):
+        raise AppError(429, "尝试次数过多，请 5 分钟后再试")
     password = body.get("password")
     if not isinstance(password, str) or not password:
         raise AppError(400, "请输入密码")

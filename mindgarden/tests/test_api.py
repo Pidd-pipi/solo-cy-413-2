@@ -382,6 +382,78 @@ def run_tests(db_file):
     check("正常测评不受影响（种子测评无 configError 字段）",
           all("configError" not in a for a in lst["assessments"]), str(lst)[:200])
 
+    print("\n[14] 并发注册：同一身份最多成功一次，失败方明确 409")
+    import threading
+
+    def burst(payloads):
+        """用 Barrier 对齐后同时发出一批注册请求，返回 [(status, body), ...]"""
+        results = [None] * len(payloads)
+        barrier = threading.Barrier(len(payloads))
+
+        def worker(i, payload):
+            c = Client()  # 每个线程独立的客户端（连接不可共享）
+            barrier.wait(timeout=15)
+            results[i] = c.req("POST", "/api/auth/register", payload)
+
+        threads = [threading.Thread(target=worker, args=(i, p))
+                   for i, p in enumerate(payloads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        return results
+
+    # 8 个请求同时抢同一个用户名
+    same_user = [{"username": "racer", "email": "racer@test.com", "password": "password123"}] * 8
+    results = burst(same_user)
+    check("全部请求都有响应", all(r is not None for r in results), str(results))
+    statuses = [s for s, _ in results]
+    check("恰好 1 个成功(201)", statuses.count(201) == 1, str(statuses))
+    check("其余全部 409 且明确「用户名」冲突（无通用 500）",
+          all(s == 409 and "用户名" in b.get("error", "")
+              for s, b in results if s != 201),
+          str([(s, b) for s, b in results if s != 201]))
+
+    conn = sqlite3.connect(db_file)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM users WHERE username = 'racer'").fetchall()
+    check("数据库恰好 1 个 racer 账号", len(rows) == 1, str(len(rows)))
+    check("账号完整（密码哈希/昵称/角色齐全）",
+          bool(rows[0]["password_hash"]) and bool(rows[0]["display_name"])
+          and rows[0]["role"] == "user",
+          str(dict(rows[0])))
+    sess = conn.execute(
+        "SELECT COUNT(*) c FROM sessions WHERE user_id = ?", (rows[0]["id"],)).fetchone()
+    check("恰好 1 个初始会话（无半成品账号）", sess["c"] == 1, str(sess["c"]))
+
+    # 8 个请求同时抢同一个邮箱（用户名各不相同）
+    same_email = [{"username": "eracer{}".format(i), "email": "shared@test.com",
+                   "password": "password123"} for i in range(8)]
+    results = burst(same_email)
+    statuses = [s for s, _ in results]
+    check("同一邮箱并发：恰好 1 个成功(201)", statuses.count(201) == 1, str(statuses))
+    check("其余全部 409 且明确「邮箱」冲突",
+          all(s == 409 and "邮箱" in b.get("error", "")
+              for s, b in results if s != 201),
+          str([(s, b) for s, b in results if s != 201]))
+    cnt = conn.execute(
+        "SELECT COUNT(*) c FROM users WHERE email = 'shared@test.com'").fetchone()
+    check("数据库恰好 1 个该邮箱账号", cnt["c"] == 1, str(cnt["c"]))
+    conn.close()
+
+    print("\n[15] 并发修复后：正常注册/登录/已有会话不受影响")
+    c = Client()
+    s, b = c.req("POST", "/api/auth/login", {"username": "racer", "password": "password123"})
+    check("竞速获胜账号可正常登录", s == 200 and b["user"]["username"] == "racer", str(b))
+    s, b = c.req("POST", "/api/auth/register",
+                 {"username": "racer", "email": "other@test.com", "password": "password123"})
+    check("顺序重复注册仍 409（预检路径）", s == 409 and "用户名" in b.get("error", ""), str(b))
+    s, b = c.req("POST", "/api/auth/register",
+                 {"username": "fresh", "email": "fresh@test.com", "password": "password123"})
+    check("全新用户正常注册(201)", s == 201, str(b))
+    s, b = alice.req("GET", "/api/auth/me")
+    check("早期建立的会话仍然有效", s == 200 and b["user"]["username"] == "alice", str(b))
+
 
 if __name__ == "__main__":
     sys.exit(main())

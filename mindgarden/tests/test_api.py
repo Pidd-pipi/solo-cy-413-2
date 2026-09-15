@@ -9,6 +9,7 @@
 """
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -72,8 +73,9 @@ def today(offset=0):
 def main():
     # 启动独立服务器（临时数据库）
     tmpdir = tempfile.mkdtemp(prefix="mg_test_")
+    db_file = os.path.join(tmpdir, "test.db")
     env = dict(os.environ)
-    env["DB_PATH"] = os.path.join(tmpdir, "test.db")
+    env["DB_PATH"] = db_file
     env["PORT"] = "18099"
     proc = subprocess.Popen(
         [sys.executable, os.path.join(SERVER_DIR, "server.py")],
@@ -88,7 +90,7 @@ def main():
         else:
             print("服务器启动失败")
             return 1
-        run_tests()
+        run_tests(db_file)
     finally:
         proc.terminate()
         proc.wait(timeout=5)
@@ -101,7 +103,7 @@ def main():
     return 0 if failed == 0 else 1
 
 
-def run_tests():
+def run_tests(db_file):
     alice = Client()
     bob = Client()
 
@@ -293,6 +295,92 @@ def run_tests():
     check("登出(200)", s == 200, str(b))
     s, b = alice.req("GET", "/api/auth/me")
     check("登出后 /me → 401", s == 401, str(b))
+
+    print("\n[11] 测评区间：保存时校验漏空/重叠/倒序")
+    s, b = alice.req("POST", "/api/auth/login", {"username": "alice", "password": "password123"})
+    check("alice 重新登录", s == 200, str(b))
+
+    def mk(bands, q_scores=((0, 2), (0, 2))):
+        # 默认两题、选项分值 {0,2}：可达总分为 {0,2,4}（1 和 3 不可达）
+        return {
+            "title": "区间校验测试", "description": "", "category": "general",
+            "questions": [
+                {"text": "题{}".format(i + 1),
+                 "options": [{"label": "选{}分".format(sc), "score": sc} for sc in scores]}
+                for i, scores in enumerate(q_scores)
+            ],
+            "bands": [dict(b, advice=b.get("advice", "")) for b in bands],
+        }
+
+    s, b = admin.req("POST", "/api/assessments", mk([
+        {"min": 0, "max": 1, "label": "低"}, {"min": 2, "max": 4, "label": "高"}]))
+    check("稀疏总分合法配置(201)：1/3 不可达不算漏空", s == 201, str(b))
+    s, b = admin.req("POST", "/api/assessments", mk([
+        {"min": 0, "max": 0, "label": "低"}, {"min": 4, "max": 4, "label": "高"}]))
+    check("漏空被拒绝(400)，原因指出具体总分",
+          s == 400 and "总分 2 没有被任何结果区间覆盖" in b.get("error", ""), str(b))
+    s, b = admin.req("POST", "/api/assessments", mk([
+        {"min": 0, "max": 2, "label": "低"}, {"min": 2, "max": 4, "label": "高"}]))
+    check("重叠被拒绝(400)，原因指出冲突区间",
+          s == 400 and "重叠" in b.get("error", "") and "0-2" in b.get("error", ""), str(b))
+    s, b = admin.req("POST", "/api/assessments", mk([
+        {"min": 3, "max": 1, "label": "坏"}, {"min": 0, "max": 4, "label": "全"}]))
+    check("倒序被拒绝(400)，原因指出具体区间",
+          s == 400 and "3-1" in b.get("error", "") and "下限" in b.get("error", ""), str(b))
+
+    print("\n[12] 存量坏数据：不写残缺报告、原因可修正、修复后恢复")
+    # 直接向数据库塞一份「历史遗留」坏测评（总分 0 没有区间覆盖）
+    conn = sqlite3.connect(db_file)
+    admin_id = conn.execute("SELECT id FROM users WHERE username = 'admin'").fetchone()[0]
+    bad_q = [{"text": "题1", "options": [{"label": "a", "score": 0}, {"label": "b", "score": 2}]}]
+    bad_bands = [{"min": 1, "max": 2, "label": "只有这一段", "advice": "x"}]
+    cur = conn.execute(
+        "INSERT INTO assessments (title, description, category, questions, bands, created_by)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        ("历史坏测评", "", "general",
+         json.dumps(bad_q, ensure_ascii=False), json.dumps(bad_bands, ensure_ascii=False), admin_id))
+    conn.commit()
+    bad_id = cur.lastrowid
+    conn.close()
+
+    s, before = alice.req("GET", "/api/reports")
+    s, b = alice.req("POST", "/api/assessments/{}/submit".format(bad_id), {"answers": [0]})
+    check("坏配置提交 → 409，含具体可修正原因",
+          s == 409 and "总分 0 没有被任何结果区间覆盖" in b.get("error", "")
+          and "未保存" in b.get("error", ""), str(b))
+    s, after = alice.req("GET", "/api/reports")
+    check("未写出残缺报告（报告数不变）", len(after["reports"]) == len(before["reports"]), str(after))
+
+    s, lst = admin.req("GET", "/api/assessments")
+    bad_item = next(a for a in lst["assessments"] if a["id"] == bad_id)
+    check("管理员列表标记 configError", bool(bad_item.get("configError")), str(bad_item))
+    s, lst_u = alice.req("GET", "/api/assessments")
+    bad_item_u = next(a for a in lst_u["assessments"] if a["id"] == bad_id)
+    check("普通用户不暴露 configError", "configError" not in bad_item_u, str(bad_item_u))
+
+    s, b = alice.req("PUT", "/api/assessments/{}".format(bad_id),
+                     mk([{"min": 0, "max": 2, "label": "好"}]))
+    check("普通用户编辑测评 → 403", s == 403, str(b))
+    s, b = admin.req("PUT", "/api/assessments/{}".format(bad_id),
+                     mk([{"min": 0, "max": 0, "label": "低"}]))
+    check("编辑保存时同样校验（仍漏空 → 400）", s == 400 and "漏空" in b.get("error", ""), str(b))
+    fixed = mk([{"min": 0, "max": 1, "label": "低"}, {"min": 2, "max": 4, "label": "高"}])
+    fixed["title"] = "历史坏测评（已修复）"
+    s, b = admin.req("PUT", "/api/assessments/{}".format(bad_id), fixed)
+    check("管理员修复成功(200)，configError 消除",
+          s == 200 and b["assessment"]["configError"] is None, str(b))
+    s, result = alice.req("POST", "/api/assessments/{}/submit".format(bad_id), {"answers": [0, 0]})
+    check("修复后可正常提交(201)，计分正确",
+          s == 201 and result["report"]["score"] == 0 and result["report"]["bandLabel"] == "低", str(result))
+
+    print("\n[13] 已有报告与汇总不受影响")
+    s, one = alice.req("GET", "/api/reports/{}".format(report_id))
+    check("此前的报告仍可读取", s == 200 and one["report"]["score"] == 4, str(one))
+    s, reports = alice.req("GET", "/api/reports")
+    check("报告汇总包含新旧两份", len(reports["reports"]) == 2, str(reports))
+    s, lst = alice.req("GET", "/api/assessments")
+    check("正常测评不受影响（种子测评无 configError 字段）",
+          all("configError" not in a for a in lst["assessments"]), str(lst)[:200])
 
 
 if __name__ == "__main__":

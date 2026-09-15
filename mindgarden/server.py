@@ -61,6 +61,7 @@ ROUTES = [
     ("GET",  "/api/assessments",                 lambda c: handlers.list_assessments(c["user"]), True),
     ("POST", "/api/assessments",                 lambda c: handlers.create_assessment(c["user"], c["body"]), True),
     ("GET",  "/api/assessments/{id}",            lambda c: handlers.get_assessment(c["user"], c["params"]["id"]), True),
+    ("PUT",  "/api/assessments/{id}",            lambda c: handlers.update_assessment(c["user"], c["params"]["id"], c["body"]), True),
     ("POST", "/api/assessments/{id}/submit",     lambda c: handlers.submit_assessment(c["user"], c["params"]["id"], c["body"]), True),
 
     ("GET",  "/api/reports",                     lambda c: handlers.list_reports(c["user"]), True),

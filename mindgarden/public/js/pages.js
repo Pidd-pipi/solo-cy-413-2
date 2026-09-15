@@ -329,89 +329,143 @@ export async function renderAssessments(el) {
             <div class="desc">${esc(a.description)}</div>
             <div class="meta">共 ${a.questionCount} 题
               ${a.myAttempts ? ` · 我已完成 ${a.myAttempts} 次` : ' · 尚未完成'}</div>
-            <a class="btn btn-primary" href="#/assessments/${a.id}" style="text-decoration:none">开始测评</a>
+            ${isAdmin() && a.configError
+              ? `<div class="config-warning">⚠️ 区间配置有误：${esc(a.configError)}</div>` : ''}
+            <div style="display:flex; gap:8px">
+              <a class="btn btn-primary" href="#/assessments/${a.id}"
+                 style="text-decoration:none; flex:1; justify-content:center">开始测评</a>
+              ${isAdmin() ? `<button class="btn btn-ghost btn-sm" data-edit-assess="${a.id}">编辑</button>` : ''}
+            </div>
           </div>`).join('')}</div>`
       : `<div class="card">${emptyState('📋', '暂时没有可用的测评', '请等待管理员发布新的测评')}</div>`}`;
 
   if (isAdmin()) {
     el.querySelector('#toggle-admin').addEventListener('click', () => {
       const panel = el.querySelector('#admin-panel');
+      const willOpen = panel.classList.contains('hidden');
       panel.classList.toggle('hidden');
-      if (!panel.dataset.ready) {
-        panel.dataset.ready = '1';
-        renderAdminForm(panel, el);
-      }
+      if (willOpen) renderAdminForm(panel, el); // 每次展开都回到「新建」状态
+    });
+    // 管理员点击卡片上的「编辑」：拉取完整配置（含分值与区间）并填入表单
+    el.querySelectorAll('[data-edit-assess]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        try {
+          const detail = await api(`/api/assessments/${btn.dataset.editAssess}`);
+          const panel = el.querySelector('#admin-panel');
+          panel.classList.remove('hidden');
+          renderAdminForm(panel, el, detail.assessment);
+          panel.scrollIntoView({ behavior: 'smooth' });
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+      });
     });
   }
 }
 
-// ---------- 管理员：创建测评 ----------
-function renderAdminForm(panel, pageEl) {
+// ---------- 管理员：创建 / 编辑测评 ----------
+const CATEGORY_LABELS = { anxiety: '焦虑', depression: '抑郁', stress: '压力', sleep: '睡眠', general: '综合' };
+
+function renderAdminForm(panel, pageEl, existing = null) {
+  const isEdit = !!existing;
   panel.innerHTML = `
     <div class="form-error hidden" id="admin-err"></div>
+    ${isEdit ? `<p class="hint" style="margin-bottom:12px">正在编辑测评 #${existing.id}：
+      保存时会重新校验全部区间（不重不漏覆盖所有可能总分），修改不影响已生成的历史报告。
+      <button class="btn btn-ghost btn-sm" id="a-cancel-edit">取消编辑</button></p>` : ''}
     <div class="grid-2">
-      <label class="field"><span>测评标题 *</span><input type="text" id="a-title" maxlength="80" placeholder="例如：情绪状态自评"></label>
+      <label class="field"><span>测评标题 *</span>
+        <input type="text" id="a-title" maxlength="80" placeholder="例如：情绪状态自评"
+               value="${esc(existing ? existing.title : '')}"></label>
       <label class="field"><span>分类 *</span>
         <select id="a-category">
-          <option value="anxiety">焦虑</option><option value="depression">抑郁</option>
-          <option value="stress">压力</option><option value="sleep">睡眠</option>
-          <option value="general" selected>综合</option>
+          ${Object.entries(CATEGORY_LABELS).map(([v, l]) =>
+            `<option value="${v}" ${existing && existing.category === v ? 'selected' : ''}>${l}</option>`).join('')}
         </select></label>
     </div>
-    <label class="field"><span>测评简介</span><textarea id="a-desc" rows="2" maxlength="500" placeholder="告诉参与者这份测评是做什么的"></textarea></label>
+    <label class="field"><span>测评简介</span>
+      <textarea id="a-desc" rows="2" maxlength="500"
+        placeholder="告诉参与者这份测评是做什么的">${esc(existing ? existing.description : '')}</textarea></label>
 
     <h3>题目（每题 2-6 个选项，选项分值 0-20）</h3>
     <div id="a-questions"></div>
     <button class="btn btn-ghost btn-sm" id="a-add-q">＋ 添加题目</button>
 
-    <h3 style="margin-top:18px">结果区间（按总分给出结论与建议）</h3>
+    <h3 style="margin-top:18px">结果区间（需不重不漏地覆盖所有可能总分，否则无法保存）</h3>
     <div id="a-bands"></div>
     <button class="btn btn-ghost btn-sm" id="a-add-band">＋ 添加区间</button>
 
     <div style="margin-top:18px">
-      <button class="btn btn-primary" id="a-submit">发布测评</button>
+      <button class="btn btn-primary" id="a-submit">${isEdit ? '保存修改' : '发布测评'}</button>
     </div>`;
 
   const qsBox = panel.querySelector('#a-questions');
   const bandsBox = panel.querySelector('#a-bands');
 
-  function addQuestion() {
+  function optionRow(label, score) {
+    const row = document.createElement('div');
+    row.className = 'admin-option-row';
+    row.innerHTML = `
+      <input type="text" class="opt-label" maxlength="60" placeholder="选项文字" value="${esc(label)}">
+      <input type="number" class="opt-score" min="0" max="20" value="${score}" title="分值">
+      <button type="button" class="icon-btn opt-del" title="删除选项">✕</button>`;
+    return row;
+  }
+
+  function addQuestion(data) {
     const div = document.createElement('div');
     div.className = 'admin-question';
     div.innerHTML = `
       <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px">
-        <input type="text" class="q-text" maxlength="200" placeholder="题干，例如：我感到紧张或心烦" style="flex:1">
+        <input type="text" class="q-text" maxlength="200" placeholder="题干，例如：我感到紧张或心烦"
+               style="flex:1" value="${esc(data ? data.text : '')}">
         <button type="button" class="icon-btn q-del" title="删除题目">✕</button>
       </div>
-      ${[0, 1, 2, 3].map((i) => `
-        <div class="admin-option-row">
-          <input type="text" class="opt-label" maxlength="60" placeholder="选项 ${i + 1} 文字">
-          <input type="number" class="opt-score" min="0" max="20" value="${i}" title="分值">
-        </div>`).join('')}`;
+      <div class="q-options"></div>
+      <button type="button" class="btn btn-ghost btn-sm q-add-opt">＋ 添加选项</button>`;
+    const optBox = div.querySelector('.q-options');
+    const options = data ? data.options : [0, 1, 2, 3].map((i) => ({ label: '', score: i }));
+    options.forEach((o) => optBox.appendChild(optionRow(o.label, o.score)));
+    div.querySelector('.q-add-opt').addEventListener('click', () => {
+      if (optBox.children.length >= 6) return toast('每题最多 6 个选项', 'error');
+      optBox.appendChild(optionRow('', optBox.children.length));
+    });
     qsBox.appendChild(div);
   }
 
-  function addBand() {
+  function addBand(data) {
     const div = document.createElement('div');
     div.className = 'admin-band-row';
     div.innerHTML = `
-      <input type="number" class="b-min" min="0" max="1000" placeholder="下限">
-      <input type="number" class="b-max" min="0" max="1000" placeholder="上限">
-      <input type="text" class="b-label" maxlength="30" placeholder="结论，如：状态良好">
-      <input type="text" class="b-advice" maxlength="300" placeholder="给参与者的建议">
+      <input type="number" class="b-min" min="0" max="1000" placeholder="下限" value="${data ? data.min : ''}">
+      <input type="number" class="b-max" min="0" max="1000" placeholder="上限" value="${data ? data.max : ''}">
+      <input type="text" class="b-label" maxlength="30" placeholder="结论，如：状态良好" value="${esc(data ? data.label : '')}">
+      <input type="text" class="b-advice" maxlength="300" placeholder="给参与者的建议" value="${esc(data ? data.advice : '')}">
       <button type="button" class="icon-btn b-del" title="删除区间">✕</button>`;
     bandsBox.appendChild(div);
   }
 
-  panel.querySelector('#a-add-q').addEventListener('click', addQuestion);
-  panel.querySelector('#a-add-band').addEventListener('click', addBand);
+  panel.querySelector('#a-add-q').addEventListener('click', () => addQuestion(null));
+  panel.querySelector('#a-add-band').addEventListener('click', () => addBand(null));
   panel.addEventListener('click', (e) => {
     if (e.target.closest('.q-del')) e.target.closest('.admin-question').remove();
     if (e.target.closest('.b-del')) e.target.closest('.admin-band-row').remove();
+    const optDel = e.target.closest('.opt-del');
+    if (optDel) {
+      const box = optDel.closest('.q-options');
+      if (box.children.length <= 2) return toast('每题至少保留 2 个选项', 'error');
+      optDel.closest('.admin-option-row').remove();
+    }
   });
 
-  addQuestion(); addQuestion(); addQuestion();
-  addBand(); addBand();
+  if (isEdit) {
+    existing.questions.forEach(addQuestion);
+    existing.bands.forEach(addBand);
+    panel.querySelector('#a-cancel-edit').addEventListener('click', () => renderAssessments(pageEl));
+  } else {
+    addQuestion(null); addQuestion(null); addQuestion(null);
+    addBand(null); addBand(null);
+  }
 
   panel.querySelector('#a-submit').addEventListener('click', async () => {
     const errBox = panel.querySelector('#admin-err');
@@ -439,17 +493,20 @@ function renderAdminForm(panel, pageEl) {
     };
     if (!payload.title) return show('请填写测评标题');
     if (!questions.length || questions.some((q) => !q.text)) return show('每道题都要填写题干');
+    if (questions.some((q) => q.options.length < 2)) return show('每道题至少需要 2 个选项');
     if (questions.some((q) => q.options.some((o) => !o.label))) return show('每个选项都要填写文字');
     if (!bands.length || bands.some((b) => !b.label)) return show('每个结果区间都要填写结论名称');
 
     const btn = panel.querySelector('#a-submit');
     btn.disabled = true;
     try {
-      await api('/api/assessments', { method: 'POST', body: payload });
-      toast('测评已发布', 'success');
+      await api(isEdit ? `/api/assessments/${existing.id}` : '/api/assessments', {
+        method: isEdit ? 'PUT' : 'POST', body: payload,
+      });
+      toast(isEdit ? '测评已更新' : '测评已发布', 'success');
       renderAssessments(pageEl);
     } catch (err) {
-      show(err.message);
+      show(err.message); // 服务端的区间校验原因（漏空/重叠/倒序）会直接展示在这里
       btn.disabled = false;
     }
   });

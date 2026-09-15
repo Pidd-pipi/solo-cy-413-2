@@ -357,13 +357,13 @@ def delete_diary(user, diary_id):
 
 # ---------------------------------------------------------------- 心理测评
 
-def _assessment_public(row, user_id, conn):
+def _assessment_public(row, user_id, conn, for_admin=False):
     questions = json.loads(row["questions"])
     attempts = conn.execute(
         "SELECT COUNT(*) c, MAX(created_at) last_at FROM assessment_results"
         " WHERE assessment_id = ? AND user_id = ?",
         (row["id"], user_id)).fetchone()
-    return {
+    data = {
         "id": row["id"],
         "title": row["title"],
         "description": row["description"],
@@ -374,12 +374,20 @@ def _assessment_public(row, user_id, conn):
         "lastTakenAt": attempts["last_at"],
         "createdAt": row["created_at"],
     }
+    if for_admin:
+        # 管理员可以看到完整配置（含分值），并实时得到区间配置体检结果
+        bands = json.loads(row["bands"])
+        data["questions"] = questions
+        data["bands"] = bands
+        data["configError"] = validate.band_config_error(questions, bands)
+    return data
 
 
 def list_assessments(user):
     conn = db.get()
+    is_admin = user["role"] == "admin"
     rows = conn.execute("SELECT * FROM assessments ORDER BY id").fetchall()
-    return 200, {"assessments": [_assessment_public(r, user["id"], conn) for r in rows]}
+    return 200, {"assessments": [_assessment_public(r, user["id"], conn, for_admin=is_admin) for r in rows]}
 
 
 def get_assessment(user, assessment_id):
@@ -387,11 +395,14 @@ def get_assessment(user, assessment_id):
     row = db.get().execute("SELECT * FROM assessments WHERE id = ?", (assessment_id,)).fetchone()
     if row is None:
         raise AppError(404, "测评不存在或已下线")
-    data = _assessment_public(row, user["id"], db.get())
-    data["questions"] = [
-        {"text": q["text"], "options": [{"label": o["label"]} for o in q["options"]]}
-        for q in json.loads(row["questions"])
-    ]
+    is_admin = user["role"] == "admin"
+    data = _assessment_public(row, user["id"], db.get(), for_admin=is_admin)
+    if not is_admin:
+        # 普通用户不返回选项分值与区间配置（防作弊）
+        data["questions"] = [
+            {"text": q["text"], "options": [{"label": o["label"]} for o in q["options"]]}
+            for q in json.loads(row["questions"])
+        ]
     return 200, {"assessment": data}
 
 
@@ -407,11 +418,35 @@ def create_assessment(user, body):
          json.dumps(payload["bands"], ensure_ascii=False), user["id"]))
     conn.commit()
     row = conn.execute("SELECT * FROM assessments WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return 201, {"assessment": _assessment_public(row, user["id"], conn)}
+    return 201, {"assessment": _assessment_public(row, user["id"], conn, for_admin=True)}
+
+
+def update_assessment(user, assessment_id, body):
+    """管理员修正测评（含历史遗留的坏区间配置）；保存时同样做全量区间校验。"""
+    require_admin(user)
+    assessment_id = validate.parse_id(assessment_id)
+    conn = db.get()
+    row = conn.execute("SELECT id FROM assessments WHERE id = ?", (assessment_id,)).fetchone()
+    if row is None:
+        raise AppError(404, "测评不存在或已下线")
+    payload = validate.assessment_payload(body)
+    conn.execute(
+        "UPDATE assessments SET title = ?, description = ?, category = ?, questions = ?, bands = ?"
+        " WHERE id = ?",
+        (payload["title"], payload["description"], payload["category"],
+         json.dumps(payload["questions"], ensure_ascii=False),
+         json.dumps(payload["bands"], ensure_ascii=False), assessment_id))
+    conn.commit()
+    fresh = conn.execute("SELECT * FROM assessments WHERE id = ?", (assessment_id,)).fetchone()
+    return 200, {"assessment": _assessment_public(fresh, user["id"], conn, for_admin=True)}
 
 
 def submit_assessment(user, assessment_id, body):
-    """计分只在服务端进行：客户端只提交选项序号，分数与结论由服务端算出并入库。"""
+    """计分只在服务端进行：客户端只提交选项序号，分数与结论由服务端算出并入库。
+
+    历史遗留的坏区间配置（漏空/重叠/倒序）会在这里被拦截：不写入残缺报告，
+    并返回具体、可修正的原因。
+    """
     assessment_id = validate.parse_id(assessment_id)
     conn = db.get()
     row = conn.execute("SELECT * FROM assessments WHERE id = ?", (assessment_id,)).fetchone()
@@ -420,7 +455,18 @@ def submit_assessment(user, assessment_id, body):
     if not isinstance(body, dict):
         raise AppError(400, "请求格式不正确")
 
-    questions = json.loads(row["questions"])
+    try:
+        questions = json.loads(row["questions"])
+        bands = json.loads(row["bands"])
+    except ValueError:
+        raise AppError(409, "该测评的配置数据已损坏，本次作答未保存，请通知管理员修正测评")
+
+    config_err = validate.band_config_error(questions, bands)
+    if config_err:
+        raise AppError(
+            409,
+            "该测评的计分区间配置有误（{}），本次作答未保存，请通知管理员修正测评".format(config_err))
+
     answers = validate.assessment_answers(body.get("answers"), len(questions))
     score = 0
     for i, q in enumerate(questions):
@@ -429,9 +475,9 @@ def submit_assessment(user, assessment_id, body):
             raise AppError(400, "第 {} 题的答案超出选项范围".format(i + 1))
         score += q["options"][idx]["score"]
 
-    bands = json.loads(row["bands"])
+    # 通过配置校验后，每个可达总分恰好落入一个区间
     band = next((b for b in bands if b["min"] <= score <= b["max"]), None)
-    if band is None:
+    if band is None:  # 理论上不可达，兜底防御
         raise AppError(500, "测评计分配置有误，请联系管理员")
 
     cur = conn.execute(

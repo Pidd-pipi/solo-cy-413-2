@@ -131,6 +131,41 @@ def search_query(value):
     return value.strip()[:50]
 
 
+def achievable_scores(questions):
+    """所有可能得到的总分集合：每题任选一个选项的分值之和（子集和）。
+
+    注意可达总分不一定是连续整数（如选项分值为 0/5 时，1-4 不可达），
+    所以区间校验必须按真实可达分数逐一核对，而不是按整数区间扫描。
+    """
+    totals = {0}
+    for q in questions:
+        scores = {o["score"] for o in q["options"]}
+        totals = {t + s for t in totals for s in scores}
+    return totals
+
+
+def band_config_error(questions, bands):
+    """校验结果区间配置：倒序 / 重叠 / 漏空。
+
+    返回 None 表示合法；否则返回具体的、可修正的中文原因。
+    创建/编辑测评时用它拒绝非法配置；提交答案时用它拦截历史坏数据。
+    """
+    try:
+        for i, b in enumerate(bands, 1):
+            if b["min"] > b["max"]:
+                return "第 {} 个结果区间（{}-{}）下限大于上限".format(i, b["min"], b["max"])
+        for score in sorted(achievable_scores(questions)):
+            hits = [b for b in bands if b["min"] <= score <= b["max"]]
+            if len(hits) > 1:
+                return "总分 {} 同时落入区间 {}-{} 和 {}-{}（重叠）".format(
+                    score, hits[0]["min"], hits[0]["max"], hits[1]["min"], hits[1]["max"])
+            if not hits:
+                return "总分 {} 没有被任何结果区间覆盖（漏空）".format(score)
+    except (KeyError, TypeError, AttributeError):
+        return "测评配置数据格式不完整"
+    return None
+
+
 def assessment_payload(body):
     """校验管理员创建测评的完整载荷，返回清洗后的 dict。"""
     if not isinstance(body, dict):
@@ -176,13 +211,16 @@ def assessment_payload(body):
         for v in (lo, hi):
             if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 1000:
                 _bad("第 {} 个结果区间的分值范围不正确".format(i))
-        if lo > hi:
-            _bad("第 {} 个结果区间的下限不能大于上限".format(i))
         label = _str(b.get("label"), "第 {} 个结果名称".format(i), 1, 30)
         advice = b.get("advice") or ""
         if not isinstance(advice, str) or len(advice.strip()) > 300:
             _bad("第 {} 个结果的建议不能超过 300 个字符".format(i))
         clean_bands.append({"min": lo, "max": hi, "label": label, "advice": advice.strip()})
+
+    # 跨区间校验：所有可达总分必须被不重不漏地覆盖，否则直接拒绝保存
+    config_err = band_config_error(clean_questions, clean_bands)
+    if config_err:
+        _bad("结果区间配置有误：" + config_err)
 
     return {
         "title": title,

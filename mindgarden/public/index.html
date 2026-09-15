@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>心晴花园 · 心理健康与情绪日记</title>
+  <meta name="description" content="记录心情、浇灌花园、完成心理测评、写下私密日记。">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌻</text></svg>">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <!-- 服务不可用横幅：网络故障 / 5xx / 维护模式时出现 -->
+  <div id="service-banner" class="service-banner hidden" role="alert">
+    <span>😔 服务暂时不可用，请稍后重试</span>
+    <button id="service-retry" type="button">重试</button>
+  </div>
+
+  <header id="navbar" class="navbar hidden">
+    <div class="nav-inner">
+      <a class="brand" href="#/garden">🌻 心晴花园</a>
+      <nav class="nav-links" id="nav-links">
+        <a href="#/garden" data-route="garden">心情花园</a>
+        <a href="#/moods" data-route="moods">情绪记录</a>
+        <a href="#/assessments" data-route="assessments">心理测评</a>
+        <a href="#/diary" data-route="diary">日记本</a>
+        <a href="#/profile" data-route="profile">我的</a>
+      </nav>
+      <div class="nav-user" id="nav-user"></div>
+    </div>
+  </header>
+
+  <main id="app" class="app">
+    <div class="loading-page">🌱 加载中…</div>
+  </main>
+
+  <footer class="footer">
+    <p>心晴花园 · 你的数据仅保存在自己的账号下</p>
+    <p class="disclaimer">测评结果仅供自我了解，不构成医疗诊断；如有持续不适，请寻求专业心理帮助。</p>
+  </footer>
+
+  <div id="toast-root"></div>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
